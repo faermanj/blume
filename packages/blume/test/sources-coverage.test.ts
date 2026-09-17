@@ -1,17 +1,21 @@
 import { afterAll, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
+import { once } from "node:events";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 
+import pLimit from "p-limit";
 import { join } from "pathe";
 
 import { BlumeError } from "../src/core/diagnostics.ts";
 import { scanProject } from "../src/core/project-graph.ts";
 import { materializeAssets } from "../src/core/sources/assets.ts";
+import type { AssetContext } from "../src/core/sources/assets.ts";
 import {
   entriesDigest,
+  hashText,
   loadWithCache,
   pollingWatch,
   snapshotCache,
@@ -469,33 +473,83 @@ describe("materializeAssets: signed-url stability", () => {
   });
 });
 
+const okBytes = (): Response => new Response(new ArrayBuffer(4));
+const okMedia = (type: string): Response =>
+  new Response(new ArrayBuffer(4), { headers: { "content-type": type } });
+const assetCtx = (dir: string, fetchImpl: typeof fetch): AssetContext => ({
+  assetsBaseUrl: "/assets",
+  assetsDir: join(dir, "assets"),
+  fetchImpl,
+});
+
 describe("materializeAssets: video sources", () => {
   it("materializes a <video> src and leaves the other attributes intact", async () => {
-    const fetchImpl = asFetch(() =>
-      Promise.resolve(new Response(new ArrayBuffer(4)))
-    );
+    const fetchImpl = asFetch(() => Promise.resolve(okBytes()));
     const dir = await tempDir();
     const { markdown } = await materializeAssets(
       '<video controls src="https://notion.so/signed/clip.mp4?X-Amz=1" />',
-      { assetsBaseUrl: "/assets", assetsDir: join(dir, "assets"), fetchImpl }
+      assetCtx(dir, fetchImpl)
     );
-    expect(markdown).toContain('<video controls src="/assets/');
-    expect(markdown).toEndWith('" />');
-    expect(markdown).not.toContain("notion.so/signed");
-    expect(markdown).toContain(".mp4");
+    const stem = hashText("https://notion.so/signed/clip.mp4");
+    expect(markdown).toBe(`<video controls src="/assets/${stem}.mp4" />`);
   });
 
-  it("names an extension-less video url .mp4 rather than .png", async () => {
-    const fetchImpl = asFetch(() =>
-      Promise.resolve(new Response(new ArrayBuffer(4)))
+  it("names an extension-less url by the response's media type", async () => {
+    const dir = await tempDir();
+    const video = await materializeAssets(
+      '<video controls src="https://cdn.example.com/stream?id=9" />',
+      assetCtx(
+        dir,
+        asFetch(() => Promise.resolve(okMedia("video/webm; codecs=vp9")))
+      )
     );
+    expect(video.markdown).toBe(
+      `<video controls src="/assets/${hashText("https://cdn.example.com/stream")}.webm" />`
+    );
+    // An image picked from Notion's Unsplash picker has no path extension and
+    // is served as JPEG; it must not be written as a .png.
+    const image = await materializeAssets(
+      "![photo](https://images.example.com/photo-1?fm=jpg)",
+      assetCtx(
+        dir,
+        asFetch(() => Promise.resolve(okMedia("image/jpeg")))
+      )
+    );
+    expect(image.markdown).toBe(
+      `![photo](/assets/${hashText("https://images.example.com/photo-1")}.jpg)`
+    );
+  });
+
+  it("falls back to .bin when neither the url nor the response names a type", async () => {
     const dir = await tempDir();
     const { markdown } = await materializeAssets(
       '<video controls src="https://cdn.example.com/stream?id=9" />',
-      { assetsBaseUrl: "/assets", assetsDir: join(dir, "assets"), fetchImpl }
+      assetCtx(
+        dir,
+        asFetch(() => Promise.resolve(okBytes()))
+      )
     );
-    expect(markdown).toContain(".mp4");
-    expect(markdown).not.toContain(".png");
+    expect(markdown).toContain(".bin");
+  });
+
+  it("refuses an html watch page and keeps the original src", async () => {
+    // A pasted Vimeo link is a video block in Notion, but the URL is a page.
+    const fetchImpl = asFetch(() =>
+      Promise.resolve(
+        new Response("<!doctype html>", {
+          headers: { "content-type": "text/html; charset=utf-8" },
+        })
+      )
+    );
+    const dir = await tempDir();
+    const { diagnostics, markdown } = await materializeAssets(
+      '<video controls src="https://vimeo.com/123" />',
+      assetCtx(dir, fetchImpl)
+    );
+    expect(diagnostics).toHaveLength(1);
+    expect(diagnostics[0]?.code).toBe("BLUME_ASSET_FETCH_FAILED");
+    expect(diagnostics[0]?.message).toContain("text/html");
+    expect(markdown).toBe('<video controls src="https://vimeo.com/123" />');
   });
 
   it("keeps the original src when the video download fails", async () => {
@@ -503,17 +557,104 @@ describe("materializeAssets: video sources", () => {
     const dir = await tempDir();
     const { diagnostics, markdown } = await materializeAssets(
       '<video controls src="https://cdn.example.com/a.mp4" />',
-      { assetsBaseUrl: "/assets", assetsDir: join(dir, "assets"), fetchImpl }
+      assetCtx(dir, fetchImpl)
     );
     expect(diagnostics[0]?.code).toBe("BLUME_ASSET_FETCH_FAILED");
     expect(markdown).toContain('src="https://cdn.example.com/a.mp4"');
+  });
+
+  it("records a diagnostic for a 200 with no body", async () => {
+    const fetchImpl = asFetch(() =>
+      Promise.resolve(new Response(null, { status: 200 }))
+    );
+    const dir = await tempDir();
+    const { diagnostics } = await materializeAssets(
+      '<video controls src="https://cdn.example.com/a.mp4" />',
+      assetCtx(dir, fetchImpl)
+    );
+    expect(diagnostics[0]?.message).toContain("empty response body");
+  });
+
+  it("aborts a download that outlives the timeout", async () => {
+    // Honors the abort signal the way a real fetch does, and never resolves
+    // otherwise — a stalled connection must fail the download, not the build.
+    const fetchImpl = asFetch(async (_input, init) => {
+      const signal = init?.signal ?? AbortSignal.timeout(1000);
+      await once(signal, "abort");
+      throw signal.reason;
+    });
+    const dir = await tempDir();
+    const { diagnostics, markdown } = await materializeAssets(
+      '<video controls src="https://cdn.example.com/a.mp4" />',
+      { ...assetCtx(dir, fetchImpl), timeoutMs: 10 }
+    );
+    expect(diagnostics[0]?.message).toContain("timed out");
+    expect(markdown).toContain('src="https://cdn.example.com/a.mp4"');
+  });
+
+  it("drops the partial file when the body stream dies midway", async () => {
+    const body = new ReadableStream<Uint8Array>({
+      pull(controller) {
+        controller.error(new Error("connection reset"));
+      },
+    });
+    const fetchImpl = asFetch(() => Promise.resolve(new Response(body)));
+    const dir = await tempDir();
+    const { diagnostics } = await materializeAssets(
+      '<video controls src="https://cdn.example.com/a.mp4" />',
+      assetCtx(dir, fetchImpl)
+    );
+    expect(diagnostics[0]?.message).toContain("connection reset");
+    expect(await readdir(join(dir, "assets"))).toStrictEqual([]);
+  });
+
+  it("reuses a file already on disk instead of downloading it again", async () => {
+    const fetched: string[] = [];
+    const fetchImpl = asFetch((input) => {
+      fetched.push(String(input));
+      return Promise.resolve(okBytes());
+    });
+    const dir = await tempDir();
+    const url = "https://notion.so/signed/clip.mp4?X-Amz=1";
+    const first = await materializeAssets(
+      `<video controls src="${url}" />`,
+      assetCtx(dir, fetchImpl)
+    );
+    // A re-signed URL on the next poll names the same file, so no fetch.
+    const second = await materializeAssets(
+      `<video controls src="${url.replace("X-Amz=1", "X-Amz=2")}" />`,
+      assetCtx(dir, fetchImpl)
+    );
+    expect(fetched).toStrictEqual([url]);
+    expect(second.markdown).toBe(first.markdown);
+  });
+
+  it("runs downloads through the shared gate", async () => {
+    let inFlight = 0;
+    let peak = 0;
+    const fetchImpl = asFetch(async () => {
+      inFlight += 1;
+      peak = Math.max(peak, inFlight);
+      await sleep(5);
+      inFlight -= 1;
+      return okBytes();
+    });
+    const dir = await tempDir();
+    const body = [1, 2, 3]
+      .map((n) => `<video controls src="https://cdn.example.com/${n}.mp4" />`)
+      .join("\n");
+    await materializeAssets(body, {
+      ...assetCtx(dir, fetchImpl),
+      limit: pLimit(1),
+    });
+    expect(peak).toBe(1);
   });
 
   it("never downloads a video url inside a code fence", async () => {
     const fetched: string[] = [];
     const fetchImpl = asFetch((input) => {
       fetched.push(String(input));
-      return Promise.resolve(new Response(new ArrayBuffer(4)));
+      return Promise.resolve(okBytes());
     });
     const dir = await tempDir();
     const body = [
@@ -524,11 +665,10 @@ describe("materializeAssets: video sources", () => {
       "```",
       "",
     ].join("\n");
-    const { markdown } = await materializeAssets(body, {
-      assetsBaseUrl: "/assets",
-      assetsDir: join(dir, "assets"),
-      fetchImpl,
-    });
+    const { markdown } = await materializeAssets(
+      body,
+      assetCtx(dir, fetchImpl)
+    );
     expect(fetched).toStrictEqual(["https://cdn.example.com/real.mp4"]);
     expect(markdown).toContain(
       '<video controls src="https://cdn.example.com/sample.mp4" />'
@@ -539,13 +679,13 @@ describe("materializeAssets: video sources", () => {
     const fetched: string[] = [];
     const fetchImpl = asFetch((input) => {
       fetched.push(String(input));
-      return Promise.resolve(new Response(new ArrayBuffer(4)));
+      return Promise.resolve(okBytes());
     });
     const dir = await tempDir();
     const url = "https://cdn.example.com/poster.png";
     const { markdown } = await materializeAssets(
       `![poster](${url})\n\n<video controls src="${url}" />`,
-      { assetsBaseUrl: "/assets", assetsDir: join(dir, "assets"), fetchImpl }
+      assetCtx(dir, fetchImpl)
     );
     expect(fetched).toStrictEqual([url]);
     expect(markdown).toContain("![poster](/assets/");

@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from "node:fs/promises";
+import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
 
 import { extname, join } from "pathe";
 
@@ -20,36 +20,79 @@ const CODE_FENCE_BLOCK =
 // oxlint-disable-next-line no-control-regex -- the NUL is the collision guard.
 const FENCE_TOKEN = /\u0000blume-fence-(?<index>\d+)\u0000/gu;
 
+// The extension for a URL whose path carries none, keyed by the media type the
+// server reports. A static host serves by extension, so a `.png` holding JPEG
+// bytes is mislabeled and a `.png` holding a video is refused by strict
+// players — the response is the source of truth, not the reference kind.
+const EXT_BY_MIME = new Map([
+  ["image/avif", ".avif"],
+  ["image/gif", ".gif"],
+  ["image/jpeg", ".jpg"],
+  ["image/png", ".png"],
+  ["image/svg+xml", ".svg"],
+  ["image/webp", ".webp"],
+  ["video/mp4", ".mp4"],
+  ["video/ogg", ".ogv"],
+  ["video/quicktime", ".mov"],
+  ["video/webm", ".webm"],
+]);
+const UNKNOWN_EXT = ".bin";
+// Generous enough for a multi-hundred-megabyte recording on an ordinary
+// connection; its job is to fail a stalled download rather than hang the build.
+const DEFAULT_TIMEOUT_MS = 120_000;
+
 /** Where to write downloaded assets and how to reference them publicly. */
 export interface AssetContext {
   assetsDir: string;
   assetsBaseUrl: string;
   /** Injected for tests; defaults to the global `fetch`. */
   fetchImpl?: typeof fetch;
+  /**
+   * Gate for concurrent downloads. A source shares one gate across every page
+   * it materializes, so a database of video-heavy pages doesn't open every
+   * download at once. Defaults to no gate.
+   */
+  limit?: <T>(task: () => Promise<T>) => Promise<T>;
+  /** Abort a download that hasn't completed within this many milliseconds. */
+  timeoutMs?: number;
 }
 
-/** Pick a file extension from a URL, falling back to the media's default. */
-const extFor = (url: string, fallback: string): string => {
+/** The extension in a URL's path, or null when it carries none we'd trust. */
+const extFromUrl = (url: string): string | null => {
   const clean = url.split("?")[0] ?? url;
   const ext = extname(clean);
-  return SAFE_EXT.test(ext) ? ext.toLowerCase() : fallback;
+  return SAFE_EXT.test(ext) ? ext.toLowerCase() : null;
 };
 
-const IMAGE_EXT = ".png";
-const VIDEO_EXT = ".mp4";
+/** The response's media type, lowercased and stripped of parameters. */
+const mediaType = (res: Response): string =>
+  res.headers.get("content-type")?.split(";")[0]?.trim().toLowerCase() ?? "";
+
+const exists = async (path: string): Promise<boolean> => {
+  try {
+    await access(path);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Download remote media referenced in a Markdown body into the asset dir and
  * rewrite the reference to the local public path. Markdown images and the
  * `src` of a `<video>` tag are both covered. Remote CMS URLs (notably Notion's
  * signed, expiring links) would otherwise rot a static build. Assets are
- * content-addressed by URL hash, so repeated builds are stable and deduped.
+ * content-addressed by URL hash, so repeated builds are stable and deduped —
+ * and a file already on disk is not fetched again, which keeps a dev poll
+ * from re-downloading every video on every tick.
  */
 export const materializeAssets = async (
   markdown: string,
   ctx: AssetContext
 ): Promise<{ markdown: string; diagnostics: Diagnostic[] }> => {
   const doFetch = ctx.fetchImpl ?? globalThis.fetch;
+  const limit = ctx.limit ?? ((task) => task());
+  const timeoutMs = ctx.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const diagnostics: Diagnostic[] = [];
 
   // Mask fenced code blocks so an image URL inside a code sample is neither
@@ -61,41 +104,71 @@ export const materializeAssets = async (
     return `\u0000blume-fence-${fences.length - 1}\u0000`;
   });
 
-  // URL -> the extension to use when the URL's path carries none, so a video
-  // that 404s the `.png` guess still lands under a playable name.
-  const urls = new Map<string, string>();
-  const collect = (pattern: RegExp, fallbackExt: string): void => {
+  const urls = new Set<string>();
+  for (const pattern of [MD_IMAGE, HTML_VIDEO_SRC]) {
     for (const match of masked.matchAll(pattern)) {
       const url = match.groups?.url;
-      if (url && REMOTE.test(url) && !urls.has(url)) {
-        urls.set(url, fallbackExt);
+      if (url && REMOTE.test(url)) {
+        urls.add(url);
       }
     }
+  }
+
+  /** Fetch one asset into the asset dir and return its file name. */
+  const download = async (url: string): Promise<string> => {
+    // Hash the query-less URL: CMS asset URLs are pre-signed, so the query
+    // changes on every fetch of the same file — hashing it would mint a new
+    // file each refresh and re-dirty the content digest. Two real assets
+    // sharing scheme+host+path and differing only in query are rare enough to
+    // accept colliding.
+    const stem = hashText(url.split("?")[0] ?? url);
+    const urlExt = extFromUrl(url);
+    // The name is known up front whenever the path has an extension (every
+    // Notion upload does), so a file from an earlier run is reused as is.
+    if (urlExt && (await exists(join(ctx.assetsDir, `${stem}${urlExt}`)))) {
+      return `${stem}${urlExt}`;
+    }
+    const res = await doFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
+    if (!res.ok) {
+      throw new Error(`${res.status}`);
+    }
+    // A pasted Vimeo/Loom/Wistia link is a video block in Notion, but its URL
+    // is a watch page: a 200 with an HTML body. Writing that as `.mp4` gives a
+    // player that can't play and a green build, so refuse anything textual.
+    const type = mediaType(res);
+    if (type.startsWith("text/")) {
+      throw new Error(`responded with ${type}, not a media file`);
+    }
+    if (!res.body) {
+      throw new Error("empty response body");
+    }
+    const file = `${stem}${urlExt ?? EXT_BY_MIME.get(type) ?? UNKNOWN_EXT}`;
+    const target = join(ctx.assetsDir, file);
+    await mkdir(ctx.assetsDir, { recursive: true });
+    // Stream the body to disk rather than buffering it: a video is hundreds of
+    // megabytes where an image was a hundred kilobytes. Write beside the final
+    // name and rename on completion, so a download that dies midway never
+    // leaves a truncated file the next run would trust as complete.
+    const part = `${target}.part`;
+    try {
+      await writeFile(part, res.body);
+    } catch (error) {
+      await rm(part, { force: true });
+      throw error;
+    }
+    await rename(part, target);
+    return file;
   };
-  collect(MD_IMAGE, IMAGE_EXT);
-  collect(HTML_VIDEO_SRC, VIDEO_EXT);
 
   const rewrites = new Map<string, string>();
   await Promise.all(
-    [...urls].map(async ([url, fallbackExt]) => {
+    [...urls].map(async (url) => {
       try {
-        const res = await doFetch(url);
-        if (!res.ok) {
-          throw new Error(`${res.status}`);
-        }
-        const bytes = new Uint8Array(await res.arrayBuffer());
-        // Hash the query-less URL (as `extFor` does): CMS asset URLs are
-        // pre-signed, so the query changes on every fetch of the same image —
-        // hashing it would mint a new file each refresh and re-dirty the
-        // content digest. Two real assets sharing scheme+host+path and
-        // differing only in query are rare enough to accept colliding.
-        const file = `${hashText(url.split("?")[0] ?? url)}${extFor(url, fallbackExt)}`;
-        await mkdir(ctx.assetsDir, { recursive: true });
-        await writeFile(join(ctx.assetsDir, file), bytes);
+        const file = await limit(() => download(url));
         rewrites.set(url, `${ctx.assetsBaseUrl}/${file}`);
       } catch (error) {
         // SAFETY: everything thrown in this block is an Error — the manual
-        // `!res.ok` throw above, and fetch/fs failures.
+        // throws in `download`, and fetch/fs failures.
         diagnostics.push({
           code: "BLUME_ASSET_FETCH_FAILED",
           message: `Failed to download asset ${url}: ${(error as Error).message}`,

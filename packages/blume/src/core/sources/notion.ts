@@ -190,6 +190,7 @@ const MAX_RETRIES = 4;
 const BASE_DELAY_MS = 500;
 const SECOND_MS = 1000;
 const DEFAULT_CONCURRENCY = 3;
+const ASSET_DOWNLOAD_CONCURRENCY = 4;
 
 /**
  * Retry a Notion API call on a `429 rate_limited`, honoring the `Retry-After`
@@ -251,6 +252,27 @@ const LIST_BLOCKS = new Set([
 const isListItem = (block: NotionBlock | undefined): boolean =>
   block !== undefined && LIST_BLOCKS.has(block.type);
 
+const richToPlain = (rich: NotionRichText[] = []): string =>
+  rich.map((node) => node.plain_text).join("");
+
+/**
+ * A string prop in JSX expression form. The quoted form (`title="…"`) keeps
+ * `\"` and `\n` as literal characters — MDX decodes no escapes there, so a
+ * caption holding a double quote fails to compile the whole page — where the
+ * expression form (`title={"…"}`) is a JSON string literal and decodes them.
+ */
+const jsxString = (value: string): string => `{${JSON.stringify(value)}}`;
+
+const YOUTUBE_HOST = /(?:^|\.)(?:youtube(?:-nocookie)?\.com|youtu\.be)$/u;
+
+// `parseYouTubeId` is host-agnostic on purpose (the component accepts bare
+// ids), so gate on the hostname first: `https://cdn.example.com/live/promo.mp4`
+// matches its `/live/<11 chars>` shape but is a media file, not an embed.
+const isYouTubeUrl = (url: string): boolean => {
+  const host = URL.parse(url)?.hostname ?? "";
+  return YOUTUBE_HOST.test(host) && parseYouTubeId(url) !== null;
+};
+
 /**
  * Render a Notion `video` block. Kept out of `renderLeaf`'s switch so that
  * function stays under the complexity limit.
@@ -264,18 +286,19 @@ const renderVideo = (data: NotionBlockPayload): string => {
   // A YouTube link pasted into Notion becomes a `video` block holding an
   // external URL. That URL is a watch page, not a media file, so it has to
   // become the embed component — a `<video src>` pointing at it plays nothing,
-  // and `materializeAssets` would download the HTML page.
-  if (parseYouTubeId(url)) {
-    const title = caption ? ` title=${JSON.stringify(caption)}` : "";
-    return `<YouTube${title} url=${JSON.stringify(url)} />`;
-  }
+  // and `materializeAssets` would download the HTML page. The iframe's title
+  // is its accessible name, so it gets the caption's plain text; the Markdown
+  // rendering goes to the Frame's caption, as it does for an upload.
+  const title = caption ? ` title=${jsxString(richToPlain(data.caption))}` : "";
   // Everything else (a Notion upload, or a direct link to a media file) is a
   // real video file: `materializeAssets` rewrites the `src`, which matters most
   // for uploads, whose Notion URLs are signed and expire.
-  const video = `<video controls src=${JSON.stringify(url)} />`;
+  const media = isYouTubeUrl(url)
+    ? `<YouTube${title} url=${JSON.stringify(url)} />`
+    : `<video controls src=${JSON.stringify(url)} />`;
   return caption
-    ? `<Frame caption=${JSON.stringify(caption)}>\n${video}\n</Frame>`
-    : video;
+    ? `<Frame caption=${jsxString(caption)}>\n${media}\n</Frame>`
+    : media;
 };
 
 /** Render a leaf (non-container) block to Markdown, or null for containers. */
@@ -342,6 +365,10 @@ export const notionSource = (
   // container — an unbounded burst guarantees 429s that even the retry loop
   // can't recover from, so every API call funnels through this limiter.
   const limit = pLimit(Math.max(1, options.concurrency ?? DEFAULT_CONCURRENCY));
+  // Asset downloads get their own gate: they go to Notion's S3, not its rate-
+  // limited API, and a slow video must not hold API slots. One gate per source
+  // bounds the fan-out across every page, not just within one.
+  const downloads = pLimit(ASSET_DOWNLOAD_CONCURRENCY);
   // Every Notion API call goes through the limiter, inside the retry — so a
   // call sleeping through a backoff doesn't hold a slot while it waits.
   const notionCall = <T>(call: () => Promise<T>): Promise<T> =>
@@ -411,7 +438,7 @@ export const notionSource = (
       return `<Callout>\n${body}\n</Callout>`;
     }
     if (block.type === "toggle") {
-      const title = JSON.stringify(richToMarkdown(blockField(block)));
+      const title = jsxString(richToMarkdown(blockField(block)));
       return `<Accordion>\n<AccordionItem title=${title}>\n${await children(block)}\n</AccordionItem>\n</Accordion>`;
     }
     if (block.type === "column_list") {
@@ -541,6 +568,7 @@ export const notionSource = (
       assetsBaseUrl,
       assetsDir,
       fetchImpl: options.fetchImpl,
+      limit: downloads,
     });
     const raw = matter.stringify(assets.markdown, data);
     return {
