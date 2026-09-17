@@ -1,4 +1,12 @@
-import { access, mkdir, rename, rm, writeFile } from "node:fs/promises";
+import { randomUUID } from "node:crypto";
+import {
+  access,
+  mkdir,
+  readdir,
+  rename,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 
 import { extname, join } from "pathe";
 
@@ -37,6 +45,12 @@ const EXT_BY_MIME = new Map([
   ["video/webm", ".webm"],
 ]);
 const UNKNOWN_EXT = ".bin";
+// Response types that are never a media file. A pasted Vimeo/Loom/Wistia link
+// is a video block in Notion whose URL is a watch page (200 text/html), and an
+// API endpoint answers JSON or XML; `image/svg+xml` is media and stays.
+const NON_MEDIA_TYPE =
+  /^(?:text\/|application\/(?:[\w.-]+\+)?(?:json|xml|javascript))/u;
+const PART_SUFFIX = ".part";
 // Generous enough for a multi-hundred-megabyte recording on an ordinary
 // connection; its job is to fail a stalled download rather than hang the build.
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -75,6 +89,28 @@ const exists = async (path: string): Promise<boolean> => {
   } catch {
     return false;
   }
+};
+
+/**
+ * The completed file for a stem whose extension came from an earlier response
+ * rather than the URL, so an extension-less asset is not fetched on every
+ * poll. Only a lone candidate counts: query-less URLs can collide, and picking
+ * between two files would be a guess.
+ */
+const completedFor = async (
+  dir: string,
+  stem: string
+): Promise<string | null> => {
+  let names: string[];
+  try {
+    names = await readdir(dir);
+  } catch {
+    return null;
+  }
+  const candidates = names.filter(
+    (name) => name.startsWith(`${stem}.`) && !name.endsWith(PART_SUFFIX)
+  );
+  return candidates.length === 1 ? (candidates[0] ?? null) : null;
 };
 
 /**
@@ -124,19 +160,23 @@ export const materializeAssets = async (
     const stem = hashText(url.split("?")[0] ?? url);
     const urlExt = extFromUrl(url);
     // The name is known up front whenever the path has an extension (every
-    // Notion upload does), so a file from an earlier run is reused as is.
+    // Notion upload does), so a file from an earlier run is reused as is;
+    // otherwise the extension came from the last response, so look for it.
     if (urlExt && (await exists(join(ctx.assetsDir, `${stem}${urlExt}`)))) {
       return `${stem}${urlExt}`;
+    }
+    const completed = urlExt ? null : await completedFor(ctx.assetsDir, stem);
+    if (completed) {
+      return completed;
     }
     const res = await doFetch(url, { signal: AbortSignal.timeout(timeoutMs) });
     if (!res.ok) {
       throw new Error(`${res.status}`);
     }
-    // A pasted Vimeo/Loom/Wistia link is a video block in Notion, but its URL
-    // is a watch page: a 200 with an HTML body. Writing that as `.mp4` gives a
-    // player that can't play and a green build, so refuse anything textual.
+    // Writing a watch page or an API response out as `.mp4` gives a player
+    // that can't play and a green build, so refuse what is never media.
     const type = mediaType(res);
-    if (type.startsWith("text/")) {
+    if (NON_MEDIA_TYPE.test(type)) {
       throw new Error(`responded with ${type}, not a media file`);
     }
     if (!res.body) {
@@ -146,10 +186,13 @@ export const materializeAssets = async (
     const target = join(ctx.assetsDir, file);
     await mkdir(ctx.assetsDir, { recursive: true });
     // Stream the body to disk rather than buffering it: a video is hundreds of
-    // megabytes where an image was a hundred kilobytes. Write beside the final
-    // name and rename on completion, so a download that dies midway never
-    // leaves a truncated file the next run would trust as complete.
-    const part = `${target}.part`;
+    // megabytes where an image was a hundred kilobytes. Write to a temporary
+    // name unique to this attempt and rename on completion, so a download that
+    // dies midway never leaves a truncated file the next run would trust as
+    // complete, and two pages fetching the same asset at once (the gate bounds
+    // concurrency, it doesn't dedupe) never write into each other's file —
+    // both publish identical bytes and the last rename wins.
+    const part = `${target}.${randomUUID()}${PART_SUFFIX}`;
     try {
       await writeFile(part, res.body);
     } catch (error) {

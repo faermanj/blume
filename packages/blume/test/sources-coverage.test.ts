@@ -2,7 +2,14 @@ import { afterAll, describe, expect, it } from "bun:test";
 import { execFileSync } from "node:child_process";
 import { once } from "node:events";
 import { realpathSync } from "node:fs";
-import { mkdir, mkdtemp, readdir, rm, writeFile } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  readdir,
+  rm,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { setTimeout as sleep } from "node:timers/promises";
 
@@ -476,6 +483,9 @@ describe("materializeAssets: signed-url stability", () => {
 const okBytes = (): Response => new Response(new ArrayBuffer(4));
 const okMedia = (type: string): Response =>
   new Response(new ArrayBuffer(4), { headers: { "content-type": type } });
+/** A fetch stub that answers every request with one prepared response. */
+const respondWith = (res: Response): typeof fetch =>
+  asFetch(() => Promise.resolve(res));
 const assetCtx = (dir: string, fetchImpl: typeof fetch): AssetContext => ({
   assetsBaseUrl: "/assets",
   assetsDir: join(dir, "assets"),
@@ -520,6 +530,46 @@ describe("materializeAssets: video sources", () => {
     );
   });
 
+  it("reuses an extension-less asset named by an earlier response", async () => {
+    const fetched: string[] = [];
+    const fetchImpl = asFetch((input) => {
+      fetched.push(String(input));
+      return Promise.resolve(okMedia("video/webm"));
+    });
+    const dir = await tempDir();
+    const url = "https://cdn.example.com/stream?sig=1";
+    const first = await materializeAssets(
+      `<video controls src="${url}" />`,
+      assetCtx(dir, fetchImpl)
+    );
+    const second = await materializeAssets(
+      `<video controls src="${url.replace("sig=1", "sig=2")}" />`,
+      assetCtx(dir, fetchImpl)
+    );
+    expect(fetched).toStrictEqual([url]);
+    expect(second.markdown).toBe(first.markdown);
+    expect(second.markdown).toContain(".webm");
+  });
+
+  it("fetches again when two completed files share an extension-less stem", async () => {
+    const fetched: string[] = [];
+    const fetchImpl = asFetch((input) => {
+      fetched.push(String(input));
+      return Promise.resolve(okMedia("video/webm"));
+    });
+    const dir = await tempDir();
+    const url = "https://cdn.example.com/stream";
+    const stem = hashText(url);
+    await mkdir(join(dir, "assets"), { recursive: true });
+    await writeFile(join(dir, "assets", `${stem}.mp4`), "");
+    await writeFile(join(dir, "assets", `${stem}.bin`), "");
+    await materializeAssets(
+      `<video controls src="${url}" />`,
+      assetCtx(dir, fetchImpl)
+    );
+    expect(fetched).toStrictEqual([url]);
+  });
+
   it("falls back to .bin when neither the url nor the response names a type", async () => {
     const dir = await tempDir();
     const { markdown } = await materializeAssets(
@@ -550,6 +600,39 @@ describe("materializeAssets: video sources", () => {
     expect(diagnostics[0]?.code).toBe("BLUME_ASSET_FETCH_FAILED");
     expect(diagnostics[0]?.message).toContain("text/html");
     expect(markdown).toBe('<video controls src="https://vimeo.com/123" />');
+  });
+
+  it("refuses structured non-media responses", async () => {
+    const dir = await tempDir();
+    const types = [
+      "application/json",
+      "application/vnd.api+json",
+      "application/xml",
+      "application/javascript",
+    ];
+    const results = await Promise.all(
+      types.map((type) =>
+        materializeAssets(
+          '<video controls src="https://api.example.com/clip.mp4" />',
+          assetCtx(dir, respondWith(okMedia(type)))
+        )
+      )
+    );
+    for (const [index, { diagnostics }] of results.entries()) {
+      expect(diagnostics[0]?.message).toContain(
+        `responded with ${types[index]}`
+      );
+    }
+    // SVG is `+xml` and is an image.
+    const svg = await materializeAssets(
+      "![logo](https://cdn.example.com/logo)",
+      assetCtx(
+        dir,
+        asFetch(() => Promise.resolve(okMedia("image/svg+xml")))
+      )
+    );
+    expect(svg.diagnostics).toStrictEqual([]);
+    expect(svg.markdown).toContain(".svg");
   });
 
   it("keeps the original src when the video download fails", async () => {
@@ -627,6 +710,31 @@ describe("materializeAssets: video sources", () => {
     );
     expect(fetched).toStrictEqual([url]);
     expect(second.markdown).toBe(first.markdown);
+  });
+
+  it("lets two pages fetch the same asset at once without corrupting it", async () => {
+    // The Notion source runs pages concurrently through one gate that bounds
+    // but does not dedupe, so the same URL can be in flight twice.
+    const bytes = new Uint8Array([1, 2, 3, 4, 5, 6, 7, 8]);
+    const fetchImpl = asFetch(async () => {
+      await sleep(5);
+      return new Response(bytes);
+    });
+    const dir = await tempDir();
+    const limit = pLimit(4);
+    const body = '<video controls src="https://cdn.example.com/shared.mp4" />';
+    const [a, b] = await Promise.all([
+      materializeAssets(body, { ...assetCtx(dir, fetchImpl), limit }),
+      materializeAssets(body, { ...assetCtx(dir, fetchImpl), limit }),
+    ]);
+    expect(a.diagnostics).toStrictEqual([]);
+    expect(b.diagnostics).toStrictEqual([]);
+    expect(a.markdown).toBe(b.markdown);
+    const files = await readdir(join(dir, "assets"));
+    expect(files).toHaveLength(1);
+    expect(
+      new Uint8Array(await readFile(join(dir, "assets", files[0] ?? "")))
+    ).toStrictEqual(bytes);
   });
 
   it("runs downloads through the shared gate", async () => {
